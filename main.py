@@ -4,11 +4,13 @@ import asyncio
 import logging
 import tempfile
 import shutil
+from datetime import datetime
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 from telethon.tl.functions.channels import JoinChannelRequest
+from aiohttp import web
 
 load_dotenv()
 
@@ -32,6 +34,64 @@ def safe_text_of(msg):
     return getattr(msg, "text", None) or getattr(msg, "message", "") or ""
 
 
+async def create_web_server():
+    """Create a simple web server for health checks"""
+    app = web.Application()
+    
+    async def health_check(request):
+        return web.Response(text="OK", status=200)
+    
+    async def status_check(request):
+        status = {
+            "status": "running",
+            "timestamp": datetime.now().isoformat(),
+            "service": "MTProto Proxy Forwarder"
+        }
+        return web.json_response(status)
+    
+    app.router.add_get('/health', health_check)
+    app.router.add_get('/status', status_check)
+    app.router.add_get('/', health_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
+    logger.info("Web server started on port 8080")
+    return runner
+
+
+async def heartbeat_ping():
+    """Send periodic pings to keep the service alive"""
+    while True:
+        try:
+            # Ping multiple services to ensure reliability
+            ping_urls = [
+                "https://httpbin.org/get",
+                "https://api.github.com",
+                "https://www.google.com"
+            ]
+            
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                for url in ping_urls:
+                    try:
+                        async with session.get(url, timeout=10) as response:
+                            if response.status == 200:
+                                logger.info(f"Heartbeat ping successful to {url}")
+                                break
+                    except Exception as e:
+                        logger.debug(f"Ping failed to {url}: {e}")
+                        continue
+            
+            # Wait 2 minutes before next ping
+            await asyncio.sleep(120)
+            
+        except Exception as e:
+            logger.error(f"Heartbeat error: {e}")
+            await asyncio.sleep(60)  # Wait 1 minute on error
+
+
 async def main():
     if not API_ID or not API_HASH or not BOT_TOKEN:
         logger.error("Please fill API_ID, API_HASH and BOT_TOKEN in .env")
@@ -41,18 +101,22 @@ async def main():
     user_client = TelegramClient(USER_SESSION, API_ID, API_HASH)
     bot_client = TelegramClient(BOT_SESSION, API_ID, API_HASH)
 
-    # --- Start / authorize user client (interactive first run) ---
+    # --- Start / authorize user client (server-friendly) ---
     await user_client.connect()
     if not await user_client.is_user_authorized():
-        # interactive login: phone -> code
-        phone = PHONE or input("Enter your phone number (international format, e.g. +1555...): ").strip()
-        await user_client.send_code_request(phone)
-        code = input("Enter the code you received: ").strip()
+        if not PHONE:
+            logger.error("PHONE environment variable is required for server deployment")
+            return
+        
         try:
-            await user_client.sign_in(phone=phone, code=code)
-        except SessionPasswordNeededError:
-            pw = input("Two-step password enabled. Enter your password: ").strip()
-            await user_client.sign_in(password=pw)
+            await user_client.send_code_request(PHONE)
+            logger.info("Verification code sent to your phone")
+            logger.info("For first-time setup, you may need to manually handle the verification")
+            # In production, you might want to implement a more robust verification system
+            return
+        except Exception as e:
+            logger.error(f"Failed to send verification code: {e}")
+            return
 
     # --- Start bot client with bot token (no phone needed) ---
     await bot_client.start(bot_token=BOT_TOKEN)
@@ -215,12 +279,26 @@ Your Freedom is Here
         except Exception as e:
             logger.exception("Error in bot handler: %s", e)
 
-    # Run both clients concurrently (they hold the loop)
-    logger.info("Started handlers. Running until disconnected...")
-    await asyncio.gather(
-        user_client.run_until_disconnected(),
-        bot_client.run_until_disconnected()
-    )
+    # Start web server for health checks
+    web_runner = await create_web_server()
+    
+    # Start heartbeat in background
+    heartbeat_task = asyncio.create_task(heartbeat_ping())
+
+    try:
+        # Run both clients concurrently with heartbeat
+        logger.info("Started handlers with heartbeat. Running until disconnected...")
+        await asyncio.gather(
+            user_client.run_until_disconnected(),
+            bot_client.run_until_disconnected(),
+            heartbeat_task
+        )
+    except Exception as e:
+        logger.error(f"Main error: {e}")
+    finally:
+        heartbeat_task.cancel()
+        await web_runner.cleanup()
+        logger.info("Cleaned up resources")
 
 
 if __name__ == "__main__":
